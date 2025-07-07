@@ -1,0 +1,16 @@
+# Document
+*.pdf
+*.docx
+*.json
+formatted_QA.txt
+
+# Environment Variable
+.env
+
+# Virtual Environment
+venv
+myenv
+env
+
+# Bot-Audio
+*.mp3
