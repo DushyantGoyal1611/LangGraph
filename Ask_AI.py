@@ -2,6 +2,7 @@
 # Learning creating Graphs
 # Connecting Categories as Node and differentiating categories from user queries based on Intent Classification
 # Also using RAG for Document Related Queries
+# Adding Memory using State
 
 import os
 import warnings
@@ -15,10 +16,9 @@ from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain.schema import HumanMessage
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Literal, Annotated
+from typing import TypedDict, Literal, Annotated, List, Tuple
 from langchain.globals import set_llm_cache
 from langchain_community.cache import InMemoryCache
-from simpleeval import simple_eval
 
 # Code Starts from here --------------------------------------------->
 warnings.filterwarnings('ignore')
@@ -122,10 +122,11 @@ def create_rag_chain(doc, prompt, parser, score_threshold=1.0, resume_text=False
 # LangGraph =================================================================================================================>
 
 # State Definition
-class State(TypedDict):    # This defines what data the graph will pass between steps.
-    question: str   # the user’s input
-    category: Literal["math", "general", "help", "greet", "bye"]    # will be either "math", "general" or "some other category"  
-    answer: str    # the final result
+class State(TypedDict):   
+    question: str
+    category: Literal["math", "irrelevant", "help", "greet", "bye"]
+    answer: str
+    history: List[Tuple[str,str]]
 
 # Router(Special Graph): Decide if it's math or general question
 def router_node(state:State) -> dict:
@@ -138,10 +139,10 @@ def router_node(state:State) -> dict:
     - **greet**: The user says hello, hi, good morning, or other greeting-like phrases.
     - **help**: The user is asking for help or support about using the Jobma platform.
     - **bye**: The user says goodbye or ends the conversation.
-    - **general**: The user is asking a general question unrelated to the bot itself (e.g., "What is the capital of France?", "Tell me a joke").
+    - **irrelevant**: The user input is unrelated to the Jobma platform or job interviews, such as asking about food, weather, sports, or general unrelated queries (e.g., "I want to make a pizza").
     - **math**: The user is asking a math-related question or calculation (e.g., "What is 3 + 5?", "Calculate 10/2", "Solve 2*3+1").
 
-    Classify the following user input strictly as one of the intents above. Your response must be a **single word** from the list: `greet`, `help`, `bye`, `math`, or `general`.
+    Classify the following user input strictly as one of the intents above. Your response must be a **single word** from the list: `greet`, `help`, `bye`, `math`, or `irrelevant`.
 
     User Input:
     "{input}"
@@ -154,30 +155,31 @@ def router_node(state:State) -> dict:
     response = llm.invoke([HumanMessage(content=formatted_prompt)])
     category = response.content.strip().lower()
 
-    if category not in ['greet', 'help', 'bye', 'general', 'math']:
-        category = 'general'    # Fallback
+    if category not in ['greet', 'help', 'bye', 'irrelevant', 'math']:
+        category = 'irrelevant'    # Fallback
     
     return {'category': category}
 
 # Math Node
 def math_node(state: State) -> dict:
     question = state.get("question", "")
+    history = state.get("history", [])
     response = llm.invoke([HumanMessage(content=question)])
-    return {"answer": response.content}
+    answer = response.content
+    history.append((question, answer))
+    return {"answer": answer, "history": history}
 
 # RAG Node
 def rag_node(state: State) -> dict:
     question = state.get("question", "")
+    history = state.get("history", [])
     rag_chain = create_rag_chain("Sensitive_Documents/formatted_QA.txt", rag_prompt, parser)
     answer = rag_chain.invoke(question)
-
-    return {"answer": answer}
+    return {"answer": answer, "history": history}
 
 # General LLM Node
-def general_node(state:State) -> dict:
-    question = state['question']
-    response = llm.invoke([HumanMessage(content=question)])
-    return {"answer": response.content}
+def irrelevant_node(state:State) -> dict:
+    return {"answer": "Sorry! I can only answer Jobma-Related Questions"}
 
 # Greet Node
 def greet_node(state: State) -> dict:
@@ -187,9 +189,7 @@ def greet_node(state: State) -> dict:
 
 # Bye Node
 def bye_node(state: State) -> dict:
-    question = state.get("question", "")
-    response = llm.invoke([HumanMessage(content=question)])
-    return {"answer": response.content}
+    return {"answer": "Goodbye! \nTake care and feel free to return anytime you need help."}
 
 
 # Build the LangGraph
@@ -198,7 +198,7 @@ builder = StateGraph(State)  # Main Graph
 builder.add_node("router", router_node)
 builder.add_node("rag_node", rag_node)
 builder.add_node("math_node", math_node)
-builder.add_node("general_node", general_node)
+builder.add_node("irrelevant_node", irrelevant_node)
 builder.add_node("greet_node", greet_node)
 builder.add_node("bye_node", bye_node)
 
@@ -210,7 +210,7 @@ builder.add_conditional_edges(
     lambda state: state['category'],
     {
         "math": "math_node",
-        "general": "general_node",
+        "irrelevant": "irrelevant_node",
         "help": "rag_node",
         "greet": "greet_node",
         "bye": "bye_node"
@@ -218,7 +218,7 @@ builder.add_conditional_edges(
 )
 
 builder.add_edge("math_node", END)
-builder.add_edge("general_node", END)
+builder.add_edge("irrelevant_node", END)
 builder.add_edge("rag_node", END)
 builder.add_edge("greet_node", END)
 builder.add_edge("bye_node", END)
@@ -232,14 +232,23 @@ print(graph.get_graph().print_ascii())
 print("=======================================================================================")
 
 def ask_ai():
+    result = {"history": []}
     while(True):
         user_question = input("Ask Something: ")
         
         if user_question == 'exit':
             break
 
-        result = graph.invoke({"question": user_question})
+        result = graph.invoke({
+            "question": user_question,
+            "history": result.get("history", []) if "history" in result else []
+        })
         print("Answer: ", result['answer'])
+    
+    print("\n Full Conversation:")
+    for q, a in result.get("history", []):
+        print(f"Human: {q}")
+        print(f"AI: {a}\n")
 
 # Run the App
 if __name__ == "__main__":
